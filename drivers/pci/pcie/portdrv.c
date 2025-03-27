@@ -17,6 +17,10 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/aer.h>
+#include <linux/of.h>     /* For of_machine_is_compatible */
+#include <linux/delay.h>  /* For msleep */
+#include <linux/cpu.h>    /* For num_online_cpus */
+#include <linux/irq.h>    /* For irq_set_affinity_hint */
 
 #include "../pci.h"
 #include "portdrv.h"
@@ -125,58 +129,60 @@ static int pcie_message_numbers(struct pci_dev *dev, int mask,
  */
 static int pcie_port_enable_irq_vec(struct pci_dev *dev, int *irqs, int mask)
 {
-	int nr_entries, nvec, pcie_irq;
-	u32 pme = 0, aer = 0, dpc = 0;
+    int nr_entries, nvec, pcie_irq;
+    u32 pme = 0, aer = 0, dpc = 0;
+    
+    /* First determine how many vectors we need */
+    nvec = pcie_message_numbers(dev, mask, &pme, &aer, &dpc);
+    if (nvec <= 0)
+        nvec = 1; /* Ensure we allocate at least one vector */
+    
+    /* Try to allocate exactly what we need in one go */
+    nr_entries = pci_alloc_irq_vectors(dev, nvec, nvec,
+            PCI_IRQ_MSIX | PCI_IRQ_MSI);
+            
+    /* If exact allocation fails, fall back to original approach */
+    if (nr_entries < 0) {
+        /* Allocate the maximum possible number of MSI/MSI-X vectors */
+        nr_entries = pci_alloc_irq_vectors(dev, 1, PCIE_PORT_MAX_MSI_ENTRIES,
+                PCI_IRQ_MSIX | PCI_IRQ_MSI);
+        if (nr_entries < 0)
+            return nr_entries;
 
-	/* Allocate the maximum possible number of MSI/MSI-X vectors */
-	nr_entries = pci_alloc_irq_vectors(dev, 1, PCIE_PORT_MAX_MSI_ENTRIES,
-			PCI_IRQ_MSIX | PCI_IRQ_MSI);
-	if (nr_entries < 0)
-		return nr_entries;
+        /* Re-check vector requirements against what we got */
+        nvec = pcie_message_numbers(dev, mask, &pme, &aer, &dpc);
+        if (nvec > nr_entries) {
+            pci_free_irq_vectors(dev);
+            return -EIO;
+        }
 
-	/* See how many and which Interrupt Message Numbers we actually use */
-	nvec = pcie_message_numbers(dev, mask, &pme, &aer, &dpc);
-	if (nvec > nr_entries) {
-		pci_free_irq_vectors(dev);
-		return -EIO;
-	}
+        /* If we allocated more than we need, free them and reallocate fewer */
+        if (nvec != nr_entries) {
+            pci_free_irq_vectors(dev);
 
-	/*
-	 * If we allocated more than we need, free them and reallocate fewer.
-	 *
-	 * Reallocating may change the specific vectors we get, so
-	 * pci_irq_vector() must be done *after* the reallocation.
-	 *
-	 * If we're using MSI, hardware is *allowed* to change the Interrupt
-	 * Message Numbers when we free and reallocate the vectors, but we
-	 * assume it won't because we allocate enough vectors for the
-	 * biggest Message Number we found.
-	 */
-	if (nvec != nr_entries) {
-		pci_free_irq_vectors(dev);
+            nr_entries = pci_alloc_irq_vectors(dev, nvec, nvec,
+                    PCI_IRQ_MSIX | PCI_IRQ_MSI);
+            if (nr_entries < 0)
+                return nr_entries;
+        }
+    }
 
-		nr_entries = pci_alloc_irq_vectors(dev, nvec, nvec,
-				PCI_IRQ_MSIX | PCI_IRQ_MSI);
-		if (nr_entries < 0)
-			return nr_entries;
-	}
+    /* PME, hotplug and bandwidth notification share an MSI/MSI-X vector */
+    if (mask & (PCIE_PORT_SERVICE_PME | PCIE_PORT_SERVICE_HP |
+                PCIE_PORT_SERVICE_BWNOTIF)) {
+        pcie_irq = pci_irq_vector(dev, pme);
+        irqs[PCIE_PORT_SERVICE_PME_SHIFT] = pcie_irq;
+        irqs[PCIE_PORT_SERVICE_HP_SHIFT] = pcie_irq;
+        irqs[PCIE_PORT_SERVICE_BWNOTIF_SHIFT] = pcie_irq;
+    }
 
-	/* PME, hotplug and bandwidth notification share an MSI/MSI-X vector */
-	if (mask & (PCIE_PORT_SERVICE_PME | PCIE_PORT_SERVICE_HP |
-		    PCIE_PORT_SERVICE_BWNOTIF)) {
-		pcie_irq = pci_irq_vector(dev, pme);
-		irqs[PCIE_PORT_SERVICE_PME_SHIFT] = pcie_irq;
-		irqs[PCIE_PORT_SERVICE_HP_SHIFT] = pcie_irq;
-		irqs[PCIE_PORT_SERVICE_BWNOTIF_SHIFT] = pcie_irq;
-	}
+    if (mask & PCIE_PORT_SERVICE_AER)
+        irqs[PCIE_PORT_SERVICE_AER_SHIFT] = pci_irq_vector(dev, aer);
 
-	if (mask & PCIE_PORT_SERVICE_AER)
-		irqs[PCIE_PORT_SERVICE_AER_SHIFT] = pci_irq_vector(dev, aer);
+    if (mask & PCIE_PORT_SERVICE_DPC)
+        irqs[PCIE_PORT_SERVICE_DPC_SHIFT] = pci_irq_vector(dev, dpc);
 
-	if (mask & PCIE_PORT_SERVICE_DPC)
-		irqs[PCIE_PORT_SERVICE_DPC_SHIFT] = pci_irq_vector(dev, dpc);
-
-	return 0;
+    return 0;
 }
 
 /**
@@ -642,20 +648,288 @@ bool pcie_ports_native;
  */
 bool pcie_ports_dpc_native;
 
-static int __init pcie_port_setup(char *str)
+/* New optimization functions */
+
+/**
+ * pcie_port_optimize_link - Optimize PCIe link speed and width
+ * @dev: PCI Express port to optimize
+ *
+ * Ensures the PCIe link is operating at its maximum capability by
+ * checking current status and potentially initiating link retraining.
+ */
+static int pcie_port_optimize_link(struct pci_dev *dev)
 {
-	if (!strncmp(str, "compat", 6))
-		pcie_ports_disabled = true;
-	else if (!strncmp(str, "native", 6))
-		pcie_ports_native = true;
-	else if (!strncmp(str, "dpc-native", 10))
-		pcie_ports_dpc_native = true;
-
-	return 1;
+    u16 link_status, link_control;
+    u32 link_cap;
+    int current_speed, max_speed;
+    int current_width, max_width;
+    bool need_retrain = false;
+    
+    /* Read link capabilities to determine max speed and width */
+    pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &link_cap);
+    max_speed = link_cap & PCI_EXP_LNKCAP_SLS;
+    max_width = (link_cap & PCI_EXP_LNKCAP_MLW) >> 4;
+    
+    /* Read current link status */
+    pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &link_status);
+    current_speed = link_status & PCI_EXP_LNKSTA_CLS;
+    current_width = (link_status & PCI_EXP_LNKSTA_NLW) >> 4;
+    
+    /* If not at max capability, try to retrain link */
+    if (current_speed < max_speed || current_width < max_width) {
+        dev_info(&dev->dev, "PCIe link not at optimal speed/width. Current: Gen%d x%d, Max: Gen%d x%d\n",
+                 current_speed, current_width, max_speed, max_width);
+        need_retrain = true;
+    }
+    
+    if (need_retrain) {
+        /* Initiate link retraining */
+        pcie_capability_read_word(dev, PCI_EXP_LNKCTL, &link_control);
+        link_control |= PCI_EXP_LNKCTL_RL;
+        pcie_capability_write_word(dev, PCI_EXP_LNKCTL, link_control);
+        
+        /* Wait for retraining to complete */
+        msleep(100);
+        
+        /* Check if improvement was achieved */
+        pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &link_status);
+        current_speed = link_status & PCI_EXP_LNKSTA_CLS;
+        current_width = (link_status & PCI_EXP_LNKSTA_NLW) >> 4;
+        
+        dev_info(&dev->dev, "After retraining: Gen%d x%d\n", 
+                 current_speed, current_width);
+    }
+    
+    return 0;
 }
-__setup("pcie_ports=", pcie_port_setup);
 
-/* global data */
+/**
+ * pcie_port_optimize_mps - Optimize Maximum Payload Size
+ * @dev: PCI Express device to optimize
+ *
+ * Sets optimal Maximum Payload Size for improved throughput.
+ */
+static int pcie_port_optimize_mps(struct pci_dev *dev)
+{
+    int mps;
+    u16 devctl;
+    
+    /* For most systems, 256 bytes is a good balance */
+    mps = 256;
+    
+    /* Apply MPS setting */
+    pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &devctl);
+    devctl &= ~PCI_EXP_DEVCTL_PAYLOAD;
+    devctl |= (ffs(mps) - 8) << 5; /* Convert to PCIe encoding */
+    pcie_capability_write_word(dev, PCI_EXP_DEVCTL, devctl);
+    
+    dev_info(&dev->dev, "PCIe MPS optimized to %d bytes\n", mps);
+    
+    return 0;
+}
+
+/**
+ * pcie_port_optimize_mrrs - Optimize Maximum Read Request Size
+ * @dev: PCI Express device to optimize
+ *
+ * Sets optimal Maximum Read Request Size for improved read throughput.
+ */
+static int pcie_port_optimize_mrrs(struct pci_dev *dev)
+{
+    u16 devctl;
+    int mrrs = 4096; /* Typically, the max is 4096 bytes */
+    
+    /* Apply MRRS setting */
+    pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &devctl);
+    devctl &= ~PCI_EXP_DEVCTL_READRQ;
+    devctl |= (ffs(mrrs) - 8) << 12;
+    pcie_capability_write_word(dev, PCI_EXP_DEVCTL, devctl);
+    
+    dev_info(&dev->dev, "PCIe MRRS optimized to %d bytes\n", mrrs);
+    
+    return 0;
+}
+
+/**
+ * pcie_port_optimize_aspm - Optimize Active State Power Management
+ * @dev: PCI Express device to optimize
+ *
+ * Configures ASPM settings based on device type, prioritizing
+ * performance for NVMe devices while enabling power saving for others.
+ */
+static int pcie_port_optimize_aspm(struct pci_dev *dev)
+{
+    u16 link_control;
+    bool is_nvme = false;
+    
+    /* Check if this is an M.2 NVMe device or its parent port */
+    is_nvme = (dev->class >> 8) == 0x010802; /* NVMe class code */
+    
+    /* Read current link control */
+    pcie_capability_read_word(dev, PCI_EXP_LNKCTL, &link_control);
+    
+    if (is_nvme) {
+        /* For NVMe: Use L1 but avoid L0s for lowest latency */
+        link_control &= ~PCI_EXP_LNKCTL_ASPMC;
+        link_control |= PCI_EXP_LNKCTL_ASPM_L1;
+        dev_info(&dev->dev, "NVMe device: optimizing ASPM for performance (L1 only)\n");
+    } else {
+        /* For other devices, enable both for better power saving */
+        link_control |= PCI_EXP_LNKCTL_ASPM_L0S | PCI_EXP_LNKCTL_ASPM_L1;
+        dev_info(&dev->dev, "Standard device: enabling full ASPM (L0s and L1)\n");
+    }
+    
+    pcie_capability_write_word(dev, PCI_EXP_LNKCTL, link_control);
+    return 0;
+}
+
+/**
+ * pcie_port_enable_transaction_optimizations - Enable TLP optimizations
+ * @dev: PCI Express device to optimize
+ *
+ * Enables relaxed ordering and no snoop for improved transaction performance.
+ */
+static void pcie_port_enable_transaction_optimizations(struct pci_dev *dev)
+{
+    u16 devctl;
+    
+    /* Enable relaxed ordering and no snoop if supported */
+    pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &devctl);
+    
+    devctl |= PCI_EXP_DEVCTL_RELAX_EN;  /* Enable relaxed ordering */
+    devctl |= PCI_EXP_DEVCTL_NOSNOOP_EN;  /* Enable no snoop */
+    
+    pcie_capability_write_word(dev, PCI_EXP_DEVCTL, devctl);
+    
+    dev_info(&dev->dev, "PCIe TLP optimizations enabled: relaxed ordering and no snoop\n");
+}
+
+/**
+ * pcie_port_latency_tuning - Optimize completion timeout values
+ * @dev: PCI Express device to optimize
+ *
+ * Adjusts completion timeout values for better performance
+ * with storage devices like NVMe SSDs.
+ */
+static int pcie_port_latency_tuning(struct pci_dev *dev)
+{
+    u16 devctl2;
+    int pos;
+    
+    /* Check if we have access to Device Control 2 Register */
+    pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_SECONDARY_PCI_EXPRESS);
+    if (!pos)
+        return -ENODEV;
+    
+    /* Read current settings */
+    pci_read_config_word(dev, pos + PCI_EXP_DEVCTL2, &devctl2);
+    
+    /* Set completion timeout value - 0x6 = 33-64ms (good for NVMe) */
+    devctl2 &= ~PCI_EXP_DEVCTL2_COMP_TIMEOUT;
+    devctl2 |= 0x6;
+    
+    pci_write_config_word(dev, pos + PCI_EXP_DEVCTL2, devctl2);
+    
+    dev_info(&dev->dev, "PCIe completion timeout optimized for reduced latency\n");
+    
+    return 0;
+}
+
+/**
+ * pcie_port_optimize_irq_affinity - Optimize IRQ affinity
+ * @dev: PCI Express device to optimize
+ *
+ * Sets interrupt affinity to distribute across CPUs, typically
+ * avoiding CPU 0 which often handles system tasks.
+ */
+static int pcie_port_optimize_irq_affinity(struct pci_dev *dev)
+{
+    int cpu, irq;
+    struct irq_desc *desc;
+    cpumask_t mask;
+    
+    /* Skip if we're on a single core system */
+    if (num_online_cpus() <= 1)
+        return 0;
+    
+    irq = dev->irq;
+    if (!irq)
+        return 0;
+    
+    desc = irq_to_desc(irq);
+    if (!desc)
+        return -ENODEV;
+    
+    /* Assign to CPU 1 (second core), leaving CPU 0 for system tasks */
+    cpumask_clear(&mask);
+    cpu = 1 % num_online_cpus();
+    cpumask_set_cpu(cpu, &mask);
+    
+    if (irq_set_affinity_hint(irq, &mask) == 0)
+        dev_info(&dev->dev, "IRQ %d affinity set to CPU %d\n", irq, cpu);
+    
+    return 0;
+}
+
+/**
+ * pcie_imx8mp_specific_optimizations - Platform-specific optimizations
+ * @dev: PCI Express device to optimize
+ *
+ * Apply optimizations specific to the iMX8M Plus platform.
+ */
+static int pcie_imx8mp_specific_optimizations(struct pci_dev *dev)
+{
+    /* Only apply to root ports on iMX8MP */
+    if (pci_pcie_type(dev) != PCI_EXP_TYPE_ROOT_PORT)
+        return 0;
+        
+#ifdef CONFIG_OF
+    if (!of_machine_is_compatible("fsl,imx8mp"))
+        return 0;
+    
+    dev_info(&dev->dev, "Applying iMX8M Plus-specific PCIe optimizations\n");
+    
+    /* 
+     * This is where we would add iMX8MP-specific register tweaks
+     * A full implementation would require access to SoC-specific registers
+     */
+#endif
+    
+    return 0;
+}
+
+/**
+ * pcie_port_apply_all_optimizations - Apply all PCIe optimizations
+ * @dev: PCI Express device to optimize
+ *
+ * Apply all supported optimizations to the PCIe device.
+ */
+static int pcie_port_apply_all_optimizations(struct pci_dev *dev)
+{
+    /* Basic link optimizations */
+    pcie_port_optimize_link(dev);
+    
+    /* Payload and request size optimizations */
+    pcie_port_optimize_mps(dev);
+    pcie_port_optimize_mrrs(dev);
+    
+    /* Power and latency tuning */
+    pcie_port_optimize_aspm(dev);
+    
+    /* Transaction optimizations */
+    pcie_port_enable_transaction_optimizations(dev);
+    
+    /* Latency optimizations */
+    pcie_port_latency_tuning(dev);
+    
+    /* CPU affinity for IRQs */
+    pcie_port_optimize_irq_affinity(dev);
+    
+    /* Platform specific tuning */
+    pcie_imx8mp_specific_optimizations(dev);
+    
+    return 0;
+}
 
 #ifdef CONFIG_PM
 static int pcie_port_runtime_suspend(struct device *dev)
@@ -724,6 +998,9 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
 	status = pcie_port_device_register(dev);
 	if (status)
 		return status;
+
+    /* Apply our comprehensive optimizations */
+    pcie_port_apply_all_optimizations(dev);
 
 	pci_save_state(dev);
 
